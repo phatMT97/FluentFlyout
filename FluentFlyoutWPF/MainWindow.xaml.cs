@@ -1502,6 +1502,8 @@ public partial class MainWindow : MicaWindow
             _displayRefreshTimer.Stop();
             _displayRefreshTimer.Tick -= DisplayRefreshTimer_Tick;
 
+            TryUnregisterSystemEvents();
+
             // unsubscribe from events
             mediaManager.OnAnyMediaPropertyChanged -= MediaManager_OnAnyMediaPropertyChanged;
             mediaManager.OnAnyPlaybackStateChanged -= CurrentSession_OnPlaybackStateChanged;
@@ -1733,6 +1735,13 @@ public partial class MainWindow : MicaWindow
 
             bool result = TryShowMediaFlyoutDebounced();
 
+            if (isVolumeCommand && SettingsManager.Current.VolumeControlEnabled)
+            {
+                volumeMixerWindow?.ViewModel.SyncMasterFromDevice();
+                volumeMixerWindow?.ShowFlyout();
+                result = true;
+            }
+
             if (!result)
             {
                 return 0;
@@ -1919,6 +1928,7 @@ public partial class MainWindow : MicaWindow
         volumeMixerWindow = new VolumeMixerWindow();
         taskbarWindow = new TaskbarWindow();
         UpdateTaskbar();
+        TryRegisterSystemEvents();
     }
 
     public void RecreateTaskbarWindow()
@@ -1946,6 +1956,99 @@ public partial class MainWindow : MicaWindow
         catch (Exception ex)
         {
             Logger.Error(ex, "Failed to recreate Taskbar Widget window");
+        }
+    }
+
+    private void TryRegisterSystemEvents()
+    {
+        try
+        {
+            SystemEvents.PowerModeChanged += OnPowerModeChanged;
+            SystemEvents.SessionSwitch += OnSessionSwitch;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn(ex, "Failed to register SystemEvents handlers for taskbar widget recovery");
+        }
+    }
+
+    private void TryUnregisterSystemEvents()
+    {
+        try
+        {
+            SystemEvents.PowerModeChanged -= OnPowerModeChanged;
+            SystemEvents.SessionSwitch -= OnSessionSwitch;
+        }
+        catch (Exception ex)
+        {
+            Logger.Warn(ex, "Failed to unregister SystemEvents handlers for taskbar widget recovery");
+        }
+    }
+
+    private void OnPowerModeChanged(object? sender, PowerModeChangedEventArgs e)
+    {
+        if (e.Mode == PowerModes.Resume)
+        {
+            HandleSystemWakeUp("power resume");
+        }
+    }
+
+    private void OnSessionSwitch(object? sender, SessionSwitchEventArgs e)
+    {
+        if (e.Reason is SessionSwitchReason.SessionUnlock or SessionSwitchReason.SessionLogon)
+        {
+            HandleSystemWakeUp($"session switch: {e.Reason}");
+        }
+    }
+
+    private void HandleSystemWakeUp(string reason)
+    {
+        if (_isCleaningUp) return;
+
+        Logger.Info($"System wake up detected ({reason}), restoring media session and taskbar widget state");
+
+        Dispatcher.BeginInvoke(async () =>
+        {
+            if (_isCleaningUp) return;
+
+            // Clear cached media property hash so any re-emitted property updates won't be discarded as duplicates
+            previousMediaProperty = "";
+            previousMediaPropertyThumbnail = 0;
+
+            // Pass 1: Initial recovery attempt after 500ms
+            await Task.Delay(500);
+            if (_isCleaningUp) return;
+            RestoreMediaAndTaskbarState();
+
+            // Pass 2: Follow-up recovery attempt after 1500ms for slower apps (e.g. Spotify, browsers)
+            await Task.Delay(1500);
+            if (_isCleaningUp) return;
+            RestoreMediaAndTaskbarState();
+        }, DispatcherPriority.Background);
+    }
+
+    private void RestoreMediaAndTaskbarState()
+    {
+        try
+        {
+            if (mediaManager.IsStarted)
+            {
+                try
+                {
+                    mediaManager.ForceUpdate();
+                }
+                catch (Exception ex)
+                {
+                    Logger.Warn(ex, "mediaManager.ForceUpdate failed during wake up recovery");
+                }
+            }
+
+            UpdateTaskbar();
+            taskbarWindow?.NotifyDisplayChanged();
+        }
+        catch (Exception ex)
+        {
+            Logger.Error(ex, "Failed to restore taskbar widget on system wake up");
         }
     }
 
